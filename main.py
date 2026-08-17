@@ -375,8 +375,15 @@ LAPORAN_SYSTEM_PROMPT = (
     "- Preventive Maintenance\n"
     "- Plant Patrol\n"
     "- Progress\n"
-    "- Challenge Session\n\n"
-    "STATUS YANG VALID: Done, In Progress, Waiting Material, Pending, -\n\n"
+    "- Challenge Session\n"
+    "- Support\n\n"
+    "STATUS YANG VALID: Done, In Progress, Waiting Material, Pending, -\n"
+    "MAPPING STATUS (terapkan tepat seperti ini):\n"
+    "  (done), DONE, Done, selesai → Done\n"
+    "  (ip), (in progress), In Progress, in progress, sedang dikerjakan → In Progress\n"
+    "  waiting material, wm → Waiting Material\n"
+    "  pending → Pending\n"
+    "  Jika tidak ada keterangan status → -\n\n"
     "DIREKSI (area kerja) — normalisasi ke format standar:\n"
     "  'Maintenance Area 7' / 'Area 7' / 'MA 7' / 'Bagian 7' → 'MA7'\n"
     "  'Maintenance Area 5' / 'Area 5' / 'MA 5' / 'Bagian 5' → 'MA5'\n"
@@ -384,17 +391,27 @@ LAPORAN_SYSTEM_PROMPT = (
     "  'Workshop' → 'Workshop'\n"
     "Jika tidak ada informasi direksi, gunakan string kosong.\n\n"
     "TAG NUMBER: Kode identifikasi equipment/alat yang biasanya ada di awal deskripsi item,\n"
-    "dipisah dengan titik dua (:) atau spasi. Contoh: 101-P-105, 104-P-107, 101A514.\n"
+    "dipisah dengan titik dua (:) atau spasi. Contoh: 101-P-105, 104-P-107, 101A514, 105-FV-020.\n"
+    "Format umum: [area]-[tipe]-[nomor] atau [area][kode][nomor].\n"
     "Jika tidak ada tag number, gunakan string kosong.\n\n"
     "ATURAN EKSTRAKSI:\n"
     "1. Satu item pekerjaan = satu entri JSON\n"
-    "2. Deteksi tanggal dari teks laporan\n"
+    "2. Deteksi tanggal dari teks laporan (format DD/MM/YYYY, DD Bulan YYYY, dsb)\n"
     "3. Deteksi disiplin dari header laporan\n"
     "4. Deteksi direksi dari header laporan, normalisasi ke MA5/MA6/MA7/Workshop sesuai aturan di atas\n"
     "5. Petakan setiap item ke kategori yang sesuai\n"
-    "6. Ekstrak status dari keterangan, jika tidak ada gunakan -\n"
+    "6. Ekstrak status menggunakan MAPPING STATUS di atas\n"
     "7. Ekstrak tag number dari awal deskripsi item jika ada\n"
-    "8. Deskripsi diisi tanpa tag number\n\n"
+    "8. Deskripsi diisi tanpa tag number (tag number sudah dipisah di field tag_number)\n"
+    "9. Catatan: info tambahan yang relevan (target tanggal, detail teknis, dll)\n\n"
+    "ATURAN MULTI-TAG (penting):\n"
+    "Jika satu baris menyebut beberapa tag sekaligus, buat SATU entri per tag.\n"
+    "Contoh: 'Perbaikan fireproofing: 105-P-506, 105-P-508, 105-P-507 (in progress)'\n"
+    "→ 3 entri terpisah, masing-masing dengan tag berbeda, deskripsi & status sama.\n\n"
+    "ATURAN ABAIKAN BARIS BERIKUT (jangan buat entri JSON):\n"
+    "- Baris template/placeholder, contoh: 'Tag Number/Equipment/Func. Loc: Aktifitas (status)', '...', '..'\n"
+    "- Baris sub-header equipment, contoh: '* Equipment : Transmitter', '* Equipment : Junction Box'\n"
+    "- Baris kosong atau hanya berisi tanda baca\n\n"
     "RESPONSE FORMAT — kembalikan HANYA array JSON, tanpa teks lain:\n"
     '[\n  {\n    "tanggal_laporan": "2026-05-26",\n    "disiplin": "Instrument",\n'
     '    "direksi": "MA7",\n    "kategori": "Plant Patrol",\n    "tag_number": "105-FV-020",\n'
@@ -404,6 +421,25 @@ LAPORAN_SYSTEM_PROMPT = (
 )
 
 # -- Laporan Functions ---------------------------------------------------------
+PLACEHOLDER_PATTERNS = [
+    r'^tag\s*number',
+    r'^func.*loc',
+    r'^\.*$',
+    r'^aktifitas',
+    r'^\s*\.\.\.*\s*$',
+]
+
+def is_junk_entry(item: dict) -> bool:
+    deskripsi  = item.get("deskripsi",  "").strip().lower()
+    tag_number = item.get("tag_number", "").strip().lower()
+    combined   = f"{tag_number} {deskripsi}".strip()
+    for pat in PLACEHOLDER_PATTERNS:
+        if re.search(pat, combined, re.IGNORECASE):
+            return True
+    if not deskripsi and not tag_number:
+        return True
+    return False
+
 def parse_laporan_with_ai(raw_text: str) -> list:
     try:
         response = call_ai([
@@ -416,22 +452,50 @@ def parse_laporan_with_ai(raw_text: str) -> list:
             return []
 
         parsed = json.loads(json_match.group())
-        return parsed if isinstance(parsed, list) else []
+        if not isinstance(parsed, list):
+            return []
+        return [item for item in parsed if not is_junk_entry(item)]
 
     except Exception as e:
         print(f"[PARSE LAPORAN ERROR] {e}")
         return []
 
 def insert_daily_report(items: list, pengirim: str, raw_text: str) -> tuple:
+    """Return: (success_count, error_msg | None, dup_warnings_list, saved_items_list)"""
     if not items:
-        return 0, "Tidak ada item yang bisa diparse"
+        return 0, "Tidak ada item yang bisa diparse", [], []
     try:
         conn = psycopg2.connect(DATABASE_URL)
         cur  = conn.cursor()
-        success = 0
+        success      = 0
+        skipped      = 0
+        dup_warnings = []
+        saved_items  = []
+
         for item in items:
             if not item.get("tanggal_laporan") or not item.get("disiplin") or not item.get("deskripsi"):
+                skipped += 1
                 continue
+
+            # Cek duplikat sebelum INSERT
+            cur.execute("""
+                SELECT id_report FROM daily_report
+                WHERE tanggal_laporan = %s
+                  AND disiplin        = %s
+                  AND tag_number      = %s
+                  AND deskripsi       = %s
+                LIMIT 1
+            """, (
+                item.get("tanggal_laporan"),
+                item.get("disiplin", "-"),
+                item.get("tag_number", ""),
+                item.get("deskripsi", "-"),
+            ))
+            if cur.fetchone():
+                label = item.get("tag_number") or item.get("deskripsi", "?")[:30]
+                dup_warnings.append(label)
+                continue
+
             cur.execute("""
                 INSERT INTO daily_report
                     (tanggal_laporan, disiplin, direksi, kategori, tag_number, deskripsi,
@@ -439,23 +503,28 @@ def insert_daily_report(items: list, pengirim: str, raw_text: str) -> tuple:
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """, (
                 item.get("tanggal_laporan"),
-                item.get("disiplin", "-"),
-                item.get("direksi", ""),
-                item.get("kategori", "-"),
-                item.get("tag_number", ""),
-                item.get("deskripsi", "-"),
+                item.get("disiplin",         "-"),
+                item.get("direksi",          ""),
+                item.get("kategori",         "-"),
+                item.get("tag_number",       ""),
+                item.get("deskripsi",        "-"),
                 item.get("status_pekerjaan", "-"),
-                item.get("catatan", ""),
+                item.get("catatan",          ""),
                 pengirim,
-                raw_text
+                raw_text,
             ))
+            saved_items.append(item)
             success += 1
+
         conn.commit()
         conn.close()
-        return success, None
+        if skipped:
+            print(f"[INSERT LAPORAN] {skipped} item dilewati (field wajib kosong)")
+        return success, None, dup_warnings, saved_items
+
     except Exception as e:
         print(f"[INSERT LAPORAN ERROR] {e}")
-        return 0, str(e)
+        return 0, str(e), [], []
 
 # -- Models --------------------------------------------------------------------
 class ChatRequest(BaseModel):
@@ -586,7 +655,7 @@ async def chat(req: ChatRequest):
                 "narrative": None, "sql": None, "row_count": 0
             }
 
-        success_count, error = insert_daily_report(items, req.pengirim, laporan_text)
+        success_count, error, dup_warnings, saved_items = insert_daily_report(items, req.pengirim, laporan_text)
         if error:
             return {
                 "type": "laporan_error",
@@ -596,19 +665,20 @@ async def chat(req: ChatRequest):
             }
 
         summary = {}
-        for item in items[:success_count]:
+        for item in saved_items:
             key = f"{item.get('disiplin', '-')} - {item.get('kategori', '-')}"
             summary[key] = summary.get(key, 0) + 1
         summary_lines = "\n".join([f"  • {k}: {v} item" for k, v in summary.items()])
+        dup_note = f"\n\n⚠️ {len(dup_warnings)} item duplikat dilewati." if dup_warnings else ""
 
         return {
             "type": "laporan_success",
             "message": (
                 f"✅ Laporan berhasil disimpan!\n\n"
                 f"📋 Total: {success_count} kegiatan tercatat\n\n"
-                f"Rincian:\n{summary_lines}"
+                f"Rincian:\n{summary_lines}{dup_note}"
             ),
-            "data": items[:success_count],
+            "data": saved_items,
             "columns": ["tanggal_laporan", "disiplin", "direksi", "kategori", "tag_number", "deskripsi", "status_pekerjaan"],
             "chart": None,
             "narrative": None,
@@ -727,14 +797,15 @@ async def submit_laporan(req: LaporanRequest):
     if not items:
         raise HTTPException(status_code=422, detail="Gagal memparse laporan. Pastikan ada tanggal, disiplin, dan daftar pekerjaan.")
 
-    success_count, error = insert_daily_report(items, req.pengirim, req.raw_text)
+    success_count, error, dup_warnings, saved_items = insert_daily_report(items, req.pengirim, req.raw_text)
     if error:
         raise HTTPException(status_code=500, detail=f"Gagal menyimpan: {error}")
 
     return {
         "success": True,
         "total_saved": success_count,
-        "items": items[:success_count]
+        "duplicates_skipped": len(dup_warnings),
+        "items": saved_items
     }
 
 # -- Download Excel ------------------------------------------------------------
