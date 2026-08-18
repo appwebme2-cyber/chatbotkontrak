@@ -9,6 +9,7 @@ import psycopg2.extras
 import os
 import json
 import re
+import uuid
 import io
 from typing import Optional
 import openpyxl
@@ -498,10 +499,11 @@ def insert_daily_report(items: list, pengirim: str, raw_text: str) -> tuple:
 
             cur.execute("""
                 INSERT INTO daily_report
-                    (tanggal_laporan, disiplin, direksi, kategori, tag_number, deskripsi,
+                    (id_report, tanggal_laporan, disiplin, direksi, kategori, tag_number, deskripsi,
                      status_pekerjaan, catatan, pengirim_wa, raw_text)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """, (
+                str(uuid.uuid4()),
                 item.get("tanggal_laporan"),
                 item.get("disiplin",         "-"),
                 item.get("direksi",          ""),
